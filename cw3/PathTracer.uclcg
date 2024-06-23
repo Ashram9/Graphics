@@ -1,0 +1,1060 @@
+// filename: cw3_student.uclcg
+// tabGroup: Coursework
+// thumbnail: cw3_thumb.png
+// displayname: Coursework 3 - 2023/2024
+// shortDescription: Coursework 3 - Path Tracing
+// author: None
+// isHidden: false
+
+function setup()
+{
+	UI = {};
+	UI.tabs = [];
+	UI.titleLong = 'Path Tracer';
+	UI.titleShort = 'PathTracer';
+	UI.numFrames = 10000;
+	UI.maxFPS = 1000;
+	UI.renderWidth = 256;
+	UI.renderHeight = 128;
+
+	UI.tabs.push(
+		{
+		visible: true,
+		type: `x-shader/x-fragment`,
+		title: `Raytracing`,
+		id: `TraceFS`,
+		initialValue: `#define SOLUTION_LIGHT
+#define SOLUTION_BOUNCE
+#define SOLUTION_THROUGHPUT
+#define SOLUTION_AA
+//#define SOLUTION_MB
+// Three Variance Reduction Methods
+// 1. Importance Sampling (cosine-weighted)
+//#define SOLUTION_VR_IS
+// 2. Quasi-Monte Carlo (Halton sequence)
+//#define SOLUTION_VR_QMC
+// 3. Next-Event Estimation
+//#define SOLUTION_VR_NEE
+
+
+precision highp float;
+
+#define M_PI 3.14159265359
+
+struct Material {
+	#ifdef SOLUTION_LIGHT
+	// Add emission property for light source
+	vec3 emission;
+	// note: the gamma effect is explained in 'Tonemapping' section
+	#endif
+	vec3 diffuse;
+	vec3 specular;
+	float glossiness;
+};
+
+struct Sphere {
+	vec3 position;
+#ifdef SOLUTION_MB
+	vec3 motion;
+#endif
+	float radius;
+	Material material;
+};
+
+struct Plane {
+	vec3 normal;
+	float d;
+	Material material;
+};
+
+const int sphereCount = 4;
+const int planeCount = 4;
+const int emittingSphereCount = 2;
+#ifdef SOLUTION_BOUNCE
+const int maxPathLength = 2;
+#else
+const int maxPathLength = 1;
+#endif 
+
+struct Scene {
+	Sphere[sphereCount] spheres;
+	Plane[planeCount] planes;
+};
+
+struct Ray {
+	vec3 origin;
+	vec3 direction;
+};
+
+// Contains all information pertaining to a ray/object intersection
+struct HitInfo {
+	bool hit;
+	float t;
+	vec3 position;
+	vec3 normal;
+	Material material;
+};
+
+// Contains info to sample a direction and this directions probability
+struct DirectionSample {
+	vec3 direction;
+	float probability;
+};
+
+HitInfo getEmptyHit() {
+	Material emptyMaterial;
+	#ifdef SOLUTION_LIGHT
+	emptyMaterial.emission = vec3(0.0);
+	#endif
+	emptyMaterial.diffuse = vec3(0.0);
+	emptyMaterial.specular = vec3(0.0);
+	emptyMaterial.glossiness = 1.0;
+	return HitInfo(false, 0.0, vec3(0.0), vec3(0.0), emptyMaterial);
+}
+
+// Sorts the two t values such that t1 is smaller than t2
+void sortT(inout float t1, inout float t2) {
+	// Make t1 the smaller t
+	if(t2 < t1)  {
+		float temp = t1;
+		t1 = t2;
+		t2 = temp;
+	}
+}
+
+// Tests if t is in an interval
+bool isTInInterval(const float t, const float tMin, const float tMax) {
+	return t > tMin && t < tMax;
+}
+
+// Get the smallest t in an interval
+bool getSmallestTInInterval(float t0, float t1, const float tMin, const float tMax, inout float smallestTInInterval) {
+
+	sortT(t0, t1);
+
+	// As t0 is smaller, test this first
+	if(isTInInterval(t0, tMin, tMax)) {
+		smallestTInInterval = t0;
+		return true;
+	}
+
+	// If t0 was not in the interval, still t1 could be
+	if(isTInInterval(t1, tMin, tMax)) {
+		smallestTInInterval = t1;
+		return true;
+	}
+
+	// None was
+	return false;
+}
+
+// Converts a random integer in 15 bits to a float in (0, 1)
+float randomIntegerToRandomFloat(int i) {
+	return float(i) / 32768.0;
+}
+
+// Returns a random integer for every pixel and dimension that remains the same in all iterations
+int pixelIntegerSeed(const int dimensionIndex) {
+	vec3 p = vec3(gl_FragCoord.xy, dimensionIndex);
+	vec3 r = vec3(23.14069263277926, 2.665144142690225,7.358926345 );
+	return int(32768.0 * fract(cos(dot(p,r)) * 123456.0));
+}
+
+// Returns a random float for every pixel that remains the same in all iterations
+float pixelSeed(const int dimensionIndex) {
+	return randomIntegerToRandomFloat(pixelIntegerSeed(dimensionIndex));
+}
+
+// The global random seed of this iteration
+// It will be set to a new random value in each step
+uniform int globalSeed;
+int randomSeed;
+void initRandomSequence() {
+	randomSeed = globalSeed + pixelIntegerSeed(0);
+}
+
+// Computes integer  x modulo y not available in most WEBGL SL implementations
+int mod(const int x, const int y) {
+	return int(float(x) - floor(float(x) / float(y)) * float(y));
+}
+
+// Returns the next integer in a pseudo-random sequence
+int rand() {
+	randomSeed = randomSeed * 1103515245 + 12345;
+	return mod(randomSeed / 65536, 32768);
+}
+
+float uniformRandomImproved(vec2 co){
+    float a = 12.9898;
+    float b = 78.233;
+    float c = 43758.5453;
+    float dt= dot(co.xy ,vec2(a,b));
+    float sn= mod(dt,3.14);
+    return fract(sin(sn) * c);
+}
+
+// Returns the next float in this pixels pseudo-random sequence
+float uniformRandom() {
+	return randomIntegerToRandomFloat(rand());
+}
+
+// This is the index of the sample controlled by the framework.
+// It increments by one in every call of this shader
+uniform int baseSampleIndex;
+
+// add a function to produce low-discrepancy sequence (Halton)
+float haltonSequence(const int index, const int base) {
+    float result = 0.0;
+    float f = 1.0 / float(base);
+    int i = index;
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        if (i <= 0) {
+            break;
+        }
+        result += f * float(mod(i, base));
+        i = i / base;
+        f = f / float(base);
+    }
+    return result;
+}
+
+// Returns a well-distributed number in (0,1) for the dimension dimensionIndex
+float sample(const int dimensionIndex) {
+	#ifdef SOLUTION_VR_QMC
+	// radical inverse base = 2
+	return haltonSequence(rand(), 2);
+	#else
+	// combining 2 PRNGs to avoid the patterns in the C-standard LCG
+	return uniformRandomImproved(vec2(uniformRandom(), uniformRandom()));
+	#endif
+}
+
+// This is a helper function to sample two-dimensionaly in dimension dimensionIndex
+vec2 sample2(const int dimensionIndex) {
+	#ifdef SOLUTION_VR_QMC
+	// radical inverse base = 2, 3 in different dimension
+	return vec2(haltonSequence(rand() + 0, 2), haltonSequence(rand() + 1, 3));
+	#else
+	return vec2(sample(dimensionIndex + 0), sample(dimensionIndex + 1));
+	#endif
+}
+
+vec3 sample3(const int dimensionIndex) {
+	#ifdef SOLUTION_VR_QMC
+	// radical inverse base = 2, 3, 5 in different dimension
+	return vec3(haltonSequence(dimensionIndex + 0, 2), haltonSequence(dimensionIndex + 1, 3), haltonSequence(dimensionIndex + 2, 5));
+	#else
+	return vec3(sample(dimensionIndex + 0), sample(dimensionIndex + 1), sample(dimensionIndex + 2));
+	#endif
+}
+
+
+// This is a register of all dimensions that we will want to sample.
+// Thanks to Iliyan Georgiev from Solid Angle for explaining proper housekeeping of sample dimensions in ranomdized Quasi-Monte Carlo
+//
+// There are infinitely many path sampling dimensions.
+// These start at PATH_SAMPLE_DIMENSION.
+// The 2D sample pair for vertex i is at PATH_SAMPLE_DIMENSION + PATH_SAMPLE_DIMENSION_MULTIPLIER * i + 0
+#define ANTI_ALIAS_SAMPLE_DIMENSION 0
+#define TIME_SAMPLE_DIMENSION 1
+#define PATH_SAMPLE_DIMENSION 3
+
+// This is 2 for two dimensions and 2 as we use it for two purposese: NEE and path connection
+#define PATH_SAMPLE_DIMENSION_MULTIPLIER (2 * 2)
+
+vec3 getEmission(const Material material, const vec3 normal) {
+	#ifdef SOLUTION_LIGHT
+	return material.emission;
+	#else
+	// This is wrong. It just returns the diffuse color so that you see something to be sure it is working.
+	return material.diffuse;
+	#endif
+}
+
+vec3 getReflectance(const Material material, const vec3 normal, const vec3 inDirection, const vec3 outDirection) {
+	#ifdef SOLUTION_THROUGHPUT
+	// Compute the reflectance using the Physically-correct Phong BRDF
+	// Compute the specular reflection direction
+	vec3 r = reflect(-inDirection, normal);
+	// Angle between reflection & out direction for specular glossness term
+	float cosAlpha = dot(normalize(outDirection), normalize(r));
+	
+	vec3 diffuseTerm = material.diffuse / M_PI;
+	vec3 specularTerm = material.specular * ((material.glossiness + 2.0) / (2.0 * M_PI)) * pow(max(0.0, cosAlpha), material.glossiness);
+
+	return (diffuseTerm + specularTerm);
+	#else
+	return vec3(1.0);
+	#endif
+}
+
+vec3 getGeometricTerm(const Material material, const vec3 normal, const vec3 inDirection, const vec3 outDirection) {
+	#ifdef SOLUTION_THROUGHPUT
+	// Compute the geometric term cosTheta
+	float cosTheta = max(0.0, dot(normal, outDirection));
+	return vec3(cosTheta);
+	#else
+	return vec3(1.0);
+	#endif
+}
+
+vec3 sphericalToEuclidean(float theta, float phi) {
+	float x = sin(theta) * cos(phi);
+	float y = sin(theta) * sin(phi);
+	float z = cos(theta);
+	return vec3(x, y, z);	
+}
+
+vec3 getRandomDirection(const int dimensionIndex) {
+	#ifdef SOLUTION_BOUNCE
+	// Note: the unit test is at the bottom of the code, check whether the sampling is unifromly random
+	vec2 sampleCoords = sample2(PATH_SAMPLE_DIMENSION + 2 * dimensionIndex);
+
+    float theta = acos(2.0 * sampleCoords.x - 1.0);
+    float phi = sampleCoords.y * 2.0 * M_PI;
+
+    return normalize(sphericalToEuclidean(theta, phi));
+	#else
+	// Put your code to compute a random direction in 3D in the #ifdef above
+	return vec3(0);
+	#endif
+}
+
+
+HitInfo intersectSphere(const Ray ray, Sphere sphere, const float tMin, const float tMax) {
+
+#ifdef SOLUTION_MB
+	sphere.position += sphere.motion * uniformRandom();
+#endif
+	
+	vec3 to_sphere = ray.origin - sphere.position;
+
+	float a = dot(ray.direction, ray.direction);
+	float b = 2.0 * dot(ray.direction, to_sphere);
+	float c = dot(to_sphere, to_sphere) - sphere.radius * sphere.radius;
+	float D = b * b - 4.0 * a * c;
+	if (D > 0.0)
+	{
+		float t0 = (-b - sqrt(D)) / (2.0 * a);
+		float t1 = (-b + sqrt(D)) / (2.0 * a);
+
+		float smallestTInInterval;
+		if(!getSmallestTInInterval(t0, t1, tMin, tMax, smallestTInInterval)) {
+			return getEmptyHit();
+		}
+
+		vec3 hitPosition = ray.origin + smallestTInInterval * ray.direction;
+
+		vec3 normal =
+			length(ray.origin - sphere.position) < sphere.radius + 0.001?
+			-normalize(hitPosition - sphere.position) :
+		normalize(hitPosition - sphere.position);
+
+		return HitInfo(
+			true,
+			smallestTInInterval,
+			hitPosition,
+			normal,
+			sphere.material);
+	}
+	return getEmptyHit();
+}
+
+HitInfo intersectPlane(Ray ray, Plane plane) {
+	float t = -(dot(ray.origin, plane.normal) + plane.d) / dot(ray.direction, plane.normal);
+	vec3 hitPosition = ray.origin + t * ray.direction;
+	return HitInfo(
+		true,
+		t,
+		hitPosition,
+		normalize(plane.normal),
+		plane.material);
+	return getEmptyHit();
+}
+
+float lengthSquared(const vec3 x) {
+	return dot(x, x);
+}
+
+HitInfo intersectScene(Scene scene, Ray ray, const float tMin, const float tMax)
+{
+	HitInfo best_hit_info;
+	best_hit_info.t = tMax;
+	best_hit_info.hit = false;
+
+	for (int i = 0; i < sphereCount; ++i) {
+		Sphere sphere = scene.spheres[i];
+		HitInfo hit_info = intersectSphere(ray, sphere, tMin, tMax);
+
+		if(	hit_info.hit &&
+		   hit_info.t < best_hit_info.t &&
+		   hit_info.t > tMin)
+		{
+			best_hit_info = hit_info;
+		}
+	}
+
+	for (int i = 0; i < planeCount; ++i) {
+		Plane plane = scene.planes[i];
+		HitInfo hit_info = intersectPlane(ray, plane);
+
+		if(	hit_info.hit &&
+		   hit_info.t < best_hit_info.t &&
+		   hit_info.t > tMin)
+		{
+			best_hit_info = hit_info;
+		}
+	}
+
+	return best_hit_info;
+}
+
+mat3 transpose(mat3 m) {
+	return mat3(
+		m[0][0], m[1][0], m[2][0],
+		m[0][1], m[1][1], m[2][1],
+		m[0][2], m[1][2], m[2][2]
+	);
+}
+
+// This function creates a matrix to transform from global space into a local space oriented around the provided vector.
+mat3 makeLocalFrame(const vec3 vector) {
+	#ifdef SOLUTION_VR_IS
+	// get a tempVector which is not collinear with vector
+	vec3 tempVector = abs(vector.z) < 0.999 ? vec3(0, 0, 1) : vec3(1, 0, 0);
+	// Find a vector perpendicular to the vector using cross product
+	vec3 tangent = normalize(cross(vector, tempVector));
+	// Find another vector perpendicular to both vector and tangent using cross product
+	vec3 bitangent = normalize(cross(vector, tangent));
+	// Form the local frame matrix
+    mat3 localFrame = mat3(tangent, bitangent, vector);
+    return localFrame;
+	#else
+	return mat3(1.0);
+	#endif
+}
+
+
+float luminance(const vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+#define EPSILON (1e-6)  // for avoiding numeric issues caused by floating point accuracy
+
+
+// add a function to test visibility between two points in the scene
+bool testVisibility(const Scene scene, const vec3 startPoint, const vec3 endPoint) {
+    // Create a shadow ray from the startPoint to the endPoint
+    Ray shadowRay;
+    shadowRay.origin = startPoint;
+    shadowRay.direction = normalize(endPoint - startPoint);
+
+    // Check if the shadow ray intersects any objects in the scene
+    HitInfo shadowHit = intersectScene(scene, shadowRay, EPSILON, length(endPoint - startPoint) - EPSILON);
+
+    // If the shadow ray hits an object, the startPoint and endPoint are not visible
+    return shadowHit.hit ? false : true;
+}
+
+// add a function, sampling from light source
+bool sampleLight(const Scene scene, const vec3 hitPosition, out vec3 lightSampleDirection, out float lightSampleProbability) {
+    // randomly choose a lightsource in the scene
+	Sphere lightSource;
+    float randomValue = sample(PATH_SAMPLE_DIMENSION);
+	if(randomValue < 0.5){
+		lightSource = scene.spheres[0];
+	}else{
+		lightSource = scene.spheres[1];
+	}
+    // randomly sample a point on ligtht source sphere
+    vec3 lightSamplePoint = lightSource.position + lightSource.radius * getRandomDirection(PATH_SAMPLE_DIMENSION + 1);
+
+    // calculate light direction and distance
+    lightSampleDirection = normalize(lightSamplePoint - hitPosition);
+    float distanceToLight = length(lightSamplePoint - hitPosition);
+
+    // calculate sampling probability by using sphere area ratio approximation
+    //float solidAngle = M_PI * lightSource.radius * lightSource.radius / (distanceToLight * distanceToLight);
+	float solidAngle = 4.0 * M_PI * (lightSource.radius*lightSource.radius)/(distanceToLight*distanceToLight);
+    lightSampleProbability = 1.0 / solidAngle;
+	
+	bool visibility = testVisibility(scene, hitPosition, lightSamplePoint);
+	return visibility;
+}
+
+DirectionSample sampleDirection(const vec3 normal, const vec3 inDirection, const vec3 diffuse, const vec3 specular, const float n, const int dimensionIndex, const Scene scene, const vec3 hitPosition) {
+	DirectionSample result;
+	
+	#ifdef SOLUTION_VR_NEE
+	vec3 lightSampleDirection;
+	float lightSampleProbability;
+	bool visibility = sampleLight(scene, hitPosition, lightSampleDirection, lightSampleProbability);
+	if (visibility){
+		result.direction = lightSampleDirection;
+		result.probability = lightSampleProbability;
+	}
+	else{
+		result.direction = getRandomDirection(dimensionIndex);	
+		result.probability = 1.0 / (4.0 * M_PI);
+	}
+	return result;
+	#endif
+		
+	#ifdef SOLUTION_VR_IS
+	// Use importance sampling
+    // Sample spherical coordinates with cosine-weighted distribution
+    vec2 sample = sample2(PATH_SAMPLE_DIMENSION_MULTIPLIER * dimensionIndex + PATH_SAMPLE_DIMENSION);
+    float theta = acos(sqrt(1.0 - sample.x));
+    float phi = 2.0 * M_PI * sample.y;
+    // Convert spherical coordinates to local frame
+    mat3 localFrame = makeLocalFrame(normal);
+    vec3 importanceSampledDirection = normalize(localFrame * sphericalToEuclidean(theta, phi));
+    // Compute the probability of the sampled direction
+    float probability = cos(theta) / M_PI;
+    
+    result.direction = importanceSampledDirection;
+    result.probability = probability;
+	return result;
+	#endif
+	
+	// Depending on the technique: put your variance reduction code in the #ifdef above 
+	result.direction = getRandomDirection(dimensionIndex);	
+	result.probability = 1.0 / (4.0 * M_PI);
+	return result;
+}
+
+vec3 samplePath(const Scene scene, const Ray initialRay) {
+
+	// Initial result is black
+	vec3 result = vec3(0);
+
+	Ray incomingRay = initialRay;
+	vec3 throughput = vec3(1.0);
+	for(int i = 0; i < maxPathLength; i++) {
+		HitInfo hitInfo = intersectScene(scene, incomingRay, 0.001, 10000.0);
+
+		if(!hitInfo.hit) return result;
+
+		if (length(hitInfo.material.emission) > 0.0) {
+            result += throughput * getEmission(hitInfo.material, hitInfo.normal);
+            break; // terminate the path if we hit a light source
+        }
+
+		Ray outgoingRay;
+		DirectionSample directionSample;
+		#ifdef SOLUTION_BOUNCE
+		directionSample = sampleDirection(hitInfo.normal, incomingRay.direction, hitInfo.material.diffuse, hitInfo.material.specular, hitInfo.material.glossiness, i, scene, hitInfo.position);
+		outgoingRay.origin = hitInfo.position;
+		outgoingRay.direction = directionSample.direction;
+		#else
+			// Put your code to compute the next ray in the #ifdef above
+		#endif
+
+		#ifdef SOLUTION_THROUGHPUT
+		// get throughput by multiplying reflectance and geometricTerm together
+		vec3 reflectance = getReflectance(hitInfo.material, hitInfo.normal, -incomingRay.direction, outgoingRay.direction);
+		vec3 geometricTerm = getGeometricTerm(hitInfo.material, hitInfo.normal, -incomingRay.direction, outgoingRay.direction);
+		// to deal with this recursive process, we multiply throughput by itself at each bounce
+		throughput *= reflectance * geometricTerm;
+		#else
+		// Compute the proper throughput in the #ifdef above 
+		throughput *= 0.1;
+		#endif
+
+		// div by probability of sampled direction 
+		throughput /= directionSample.probability; 
+	
+		#ifdef SOLUTION_BOUNCE
+		incomingRay = outgoingRay;
+		#else
+		// Put some handling of the next and the current ray in the #ifdef above
+		#endif
+	}
+	return result;
+}
+
+uniform ivec2 resolution;
+Ray getFragCoordRay(const vec2 fragCoord) {
+
+	float sensorDistance = 1.0;
+	vec3 origin = vec3(0, 0, sensorDistance);
+	vec2 sensorMin = vec2(-1, -0.5);
+	vec2 sensorMax = vec2(1, 0.5);
+	vec2 pixelSize = (sensorMax - sensorMin) / vec2(resolution);
+	vec3 direction = normalize(vec3(sensorMin + pixelSize * fragCoord, -sensorDistance));
+
+	float apertureSize = 0.0;
+	float focalPlane = 100.0;
+	vec3 sensorPosition = origin + focalPlane * direction;
+	origin.xy += -vec2(0.5);
+	direction = normalize(sensorPosition - origin);
+
+	return Ray(origin, direction);
+}
+
+vec3 colorForFragment(const Scene scene, const vec2 fragCoord) {
+    initRandomSequence();
+
+    #ifdef SOLUTION_AA
+    // set sample number
+    const int numSamples = 4;
+    vec3 color = vec3(0.0);
+
+    vec2 sampleCoord = fragCoord;
+	// box filter: multi-sampling in subpixel level around the pixel with certain times and take the average value
+    for (int i = 0; i < numSamples; ++i) {
+		// sample function will returns a well-distributed 2D vector in (0,1)
+		// we need to minus 0.5 to get the subpixels around the fragCoord
+        vec2 sampleOffset = sample2(ANTI_ALIAS_SAMPLE_DIMENSION + i) - 0.5;
+        sampleCoord = fragCoord + sampleOffset;
+        
+        color += samplePath(scene, getFragCoordRay(sampleCoord));
+    }
+    // take the average
+    color /= float(numSamples);
+    return color;
+    #else  	
+    // Put your anti-aliasing code in the #ifdef above
+    vec2 sampleCoord = fragCoord;
+    #endif
+    return samplePath(scene, getFragCoordRay(sampleCoord));
+}
+
+void loadScene1(inout Scene scene) {
+
+	scene.spheres[0].position = vec3(7, -2, -12);
+	scene.spheres[0].radius = 2.0;
+	// Set the value of the missing property in the ifdef below 
+#ifdef SOLUTION_LIGHT
+	scene.spheres[0].material.emission = 15.0 * vec3(0.9, 0.9, 0.5);
+#endif
+	scene.spheres[0].material.diffuse = vec3(0.5);
+	scene.spheres[0].material.specular = vec3(0.5);
+	scene.spheres[0].material.glossiness = 10.0;
+	// Set the value of the missing property in the ifdef below 
+#ifdef SOLUTION_MB
+	scene.spheres[0].motion = vec3(0.0);
+#endif
+	
+	scene.spheres[1].position = vec3(-8, 4, -13);
+	scene.spheres[1].radius = 1.0;
+	// Set the value of the missing property in the ifdef below 
+#ifdef SOLUTION_LIGHT
+	scene.spheres[1].material.emission = 15.0 * vec3(0.8, 0.3, 0.1);
+#endif
+	scene.spheres[1].material.diffuse = vec3(0.5);
+	scene.spheres[1].material.specular = vec3(0.5);
+	scene.spheres[1].material.glossiness = 10.0;
+	// Set the value of the missing property in the ifdef below 
+#ifdef SOLUTION_MB
+	scene.spheres[1].motion = vec3(0.0);
+#endif
+	
+	scene.spheres[2].position = vec3(-2, -2, -12);
+	scene.spheres[2].radius = 3.0;
+	// Set the value of the missing property in the ifdef below 
+#ifdef SOLUTION_LIGHT
+	scene.spheres[2].material.emission = vec3(0.0);
+#endif  
+	scene.spheres[2].material.diffuse = vec3(0.2, 0.5, 0.8);
+	scene.spheres[2].material.specular = vec3(0.8);
+	scene.spheres[2].material.glossiness = 40.0;
+	// Set the value of the missing property in the ifdef below 
+#ifdef SOLUTION_MB
+	scene.spheres[2].motion = vec3(-3.0, 0.0, 3.0);
+#endif
+	
+	scene.spheres[3].position = vec3(3, -3.5, -14);
+	scene.spheres[3].radius = 1.0;
+	// Set the value of the missing property in the ifdef below 
+#ifdef SOLUTION_LIGHT
+	scene.spheres[3].material.emission = vec3(0.0);
+#endif  
+	scene.spheres[3].material.diffuse = vec3(0.9, 0.8, 0.8);
+	scene.spheres[3].material.specular = vec3(1.0);
+	scene.spheres[3].material.glossiness = 10.0;
+	// Set the value of the missing property in the ifdef below 
+#ifdef SOLUTION_MB
+	scene.spheres[3].motion = vec3(2.0, 4.0, 1.0);
+#endif
+	
+	scene.planes[0].normal = vec3(0, 1, 0);
+	scene.planes[0].d = 4.5;
+	// Set the value of the missing property in the ifdef below 
+#ifdef SOLUTION_LIGHT
+	scene.planes[0].material.emission = vec3(0.0);
+#endif
+	scene.planes[0].material.diffuse = vec3(0.8);
+	scene.planes[0].material.specular = vec3(0.0);
+	scene.planes[0].material.glossiness = 50.0;    
+
+	scene.planes[1].normal = vec3(0, 0, 1);
+	scene.planes[1].d = 18.5;
+	// Set the value of the missing property in the ifdef below 
+#ifdef SOLUTION_LIGHT 
+	scene.planes[1].material.emission = vec3(0.0);
+#endif
+	scene.planes[1].material.diffuse = vec3(0.9, 0.6, 0.3);
+	scene.planes[1].material.specular = vec3(0.02);
+	scene.planes[1].material.glossiness = 3000.0;
+
+	scene.planes[2].normal = vec3(1, 0,0);
+	scene.planes[2].d = 10.0;
+	// Set the value of the missing property in the ifdef below 
+#ifdef SOLUTION_LIGHT
+	scene.planes[2].material.emission = vec3(0.0);
+#endif
+	scene.planes[2].material.diffuse = vec3(0.2);
+	scene.planes[2].material.specular = vec3(0.1);
+	scene.planes[2].material.glossiness = 100.0; 
+
+	scene.planes[3].normal = vec3(-1, 0,0);
+	scene.planes[3].d = 10.0;
+	// Set the value of the missing property in the ifdef below 
+#ifdef SOLUTION_LIGHT
+	scene.planes[3].material.emission = vec3(0.0);
+#endif
+	scene.planes[3].material.diffuse = vec3(0.2);
+	scene.planes[3].material.specular = vec3(0.1);
+	scene.planes[3].material.glossiness = 100.0; 
+}
+
+
+// add a function for unit test
+bool testRandomDirection() {
+	// number of sampling
+    const int numSamples = 1000;
+	// the threshold represents smallest tolerance for comparisons
+	// in the case of numSample is 1000, if set the threshold >= 14.0, we regard it as uniform sampling.
+	// otherwise, return false and the whole scene will turn red.
+    const float threshold = 1.0;
+
+    bool success = true;
+
+    // Array to store the histogram of generated directions
+	const int numBinsPhi = 10;
+    int bins[numBinsPhi];
+    for (int i = 0; i < numBinsPhi; ++i) {
+        bins[i] = 0;
+    }
+
+    for (int i = 0; i < numSamples; ++i) {
+        vec2 sampleCoords = sample2(PATH_SAMPLE_DIMENSION + 2 * i);
+        float theta = acos(2.0 * sampleCoords.x - 1.0);
+        float phi = sampleCoords.y * 2.0 * M_PI;
+
+        // Calculate the bin index based on the azimuthal angle phi
+        int binIndex = int(floor(phi / (2.0 * M_PI) * 10.0));
+        
+        // Increment the corresponding bin in the histogram
+        //bins[binIndex]++;
+		if (binIndex == 0) {
+			bins[0]++;
+		} else if (binIndex == 1) {
+			bins[1]++;
+		} else if (binIndex == 2) {
+			bins[2]++;
+		} else if (binIndex == 3) {
+			bins[3]++;
+		} else if (binIndex == 4) {
+			bins[4]++;
+		} else if (binIndex == 5) {
+			bins[5]++;
+		} else if (binIndex == 6) {
+			bins[6]++;
+		} else if (binIndex == 7) {
+			bins[7]++;
+		} else if (binIndex == 8) {
+			bins[8]++;
+		} else if (binIndex == 9) {
+			bins[9]++;
+		}
+    }
+	
+	// check whether the random sampling direction is uniform
+    for (int i = 0; i < numBinsPhi; ++i) {
+        float expectedCount = float(numSamples) / float(numBinsPhi);
+        if (abs(float(bins[i]) - expectedCount) > threshold) {
+            // non-uniform sampling: if the difference is smaller than a threshold
+            return false;
+        }
+    }
+
+    return success;
+}
+
+
+void main() {
+    // Set a flag for the unit test
+    bool runTest = false;
+
+    if (runTest) {
+		// use function testRandomDirection(), with descriptions in it
+        bool testResult = testRandomDirection();
+        if (testResult) {
+            // Test passed
+			Scene scene;
+			loadScene1(scene);
+			// compute color for fragment
+			gl_FragColor.rgb = colorForFragment(scene, gl_FragCoord.xy);
+			gl_FragColor.a = 1.0;
+        } else {
+            // Test failed, non-uniform random sampling, set the color of whole screen to red
+			gl_FragColor.rgb = vec3(1.0, 0.0, 0.0);
+			gl_FragColor.a = 1.0;
+        }
+    } else {
+        // Your regular rendering logic
+        // Setup scene
+		Scene scene;
+		loadScene1(scene);
+
+		// compute color for fragment
+		gl_FragColor.rgb = colorForFragment(scene, gl_FragCoord.xy);
+		gl_FragColor.a = 1.0;
+    }
+}
+`,
+		description: ``,
+		wrapFunctionStart: ``,
+		wrapFunctionEnd: ``
+	});
+
+	UI.tabs.push(
+		{
+		visible: true,
+		type: `x-shader/x-fragment`,
+		title: `Tonemapping`,
+		id: `CopyFS`,
+		initialValue: `precision highp float;
+
+uniform sampler2D radianceTexture;
+uniform int sampleCount;
+uniform ivec2 resolution;
+
+/*
+	Because human eye perceives brightness in a non-linear manner, Gamma-mapping aims to convert physically linear units the simulation produces into non-linear values the display expects, which will make images appear more natural and aligned with human perception during display.
+	The gamma correction formula is commonly expressed as: Output luminance = (Input luminance) ^ gamma
+	In this case, the default value of gamma is 1.6, which means the contrast is enhanced.
+*/
+vec3 tonemap(vec3 color, float maxLuminance, float gamma) {
+	float luminance = length(color);
+	//float scale =  luminance /  maxLuminance;
+	float scale =  luminance / (maxLuminance * luminance + 0.0000001);
+  	return max(vec3(0.0), pow(scale * color, vec3(1.0 / gamma)));
+}
+
+void main(void) {
+  vec3 texel = texture2D(radianceTexture, gl_FragCoord.xy / vec2(resolution)).rgb;
+  vec3 radiance = texel / float(sampleCount);
+  gl_FragColor.rgb = tonemap(radiance, 1.0, 1.6);
+  gl_FragColor.a = 1.0;
+}
+`,
+		description: ``,
+		wrapFunctionStart: ``,
+		wrapFunctionEnd: ``
+	});
+
+	UI.tabs.push(
+		{
+		visible: false,
+		type: `x-shader/x-vertex`,
+		title: ``,
+		id: `VS`,
+		initialValue: `
+	attribute vec3 position;
+	void main(void) {
+		gl_Position = vec4(position, 1.0);
+	}
+`,
+		description: ``,
+		wrapFunctionStart: ``,
+		wrapFunctionEnd: ``
+	});
+
+	 return UI; 
+}//!setup
+
+
+function getShader(gl, id) {
+
+		gl.getExtension('OES_texture_float');
+		//alert(gl.getSupportedExtensions());
+
+	var shaderScript = document.getElementById(id);
+	if (!shaderScript) {
+		return null;
+	}
+
+	var str = "";
+	var k = shaderScript.firstChild;
+	while (k) {
+		if (k.nodeType == 3) {
+			str += k.textContent;
+		}
+		k = k.nextSibling;
+	}
+
+	var shader;
+	if (shaderScript.type == "x-shader/x-fragment") {
+		shader = gl.createShader(gl.FRAGMENT_SHADER);
+	} else if (shaderScript.type == "x-shader/x-vertex") {
+		shader = gl.createShader(gl.VERTEX_SHADER);
+	} else {
+		return null;
+	}
+
+    console.log(str);
+	gl.shaderSource(shader, str);
+	gl.compileShader(shader);
+
+	if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+		alert(gl.getShaderInfoLog(shader));
+		return null;
+	}
+
+	return shader;
+}
+
+function RaytracingDemo() {
+}
+
+function initShaders() {
+
+	traceProgram = gl.createProgram();
+	gl.attachShader(traceProgram, getShader(gl, "VS"));
+	gl.attachShader(traceProgram, getShader(gl, "TraceFS"));
+	gl.linkProgram(traceProgram);
+	gl.useProgram(traceProgram);
+	traceProgram.vertexPositionAttribute = gl.getAttribLocation(traceProgram, "position");
+	gl.enableVertexAttribArray(traceProgram.vertexPositionAttribute);
+
+	copyProgram = gl.createProgram();
+	gl.attachShader(copyProgram, getShader(gl, "VS"));
+	gl.attachShader(copyProgram, getShader(gl, "CopyFS"));
+	gl.linkProgram(copyProgram);
+	gl.useProgram(copyProgram);
+	traceProgram.vertexPositionAttribute = gl.getAttribLocation(copyProgram, "position");
+	gl.enableVertexAttribArray(copyProgram.vertexPositionAttribute);
+
+}
+
+function initBuffers() {
+	triangleVertexPositionBuffer = gl.createBuffer();
+	gl.bindBuffer(gl.ARRAY_BUFFER, triangleVertexPositionBuffer);
+
+	var vertices = [
+		 -1,  -1,  0,
+		 -1,  1,  0,
+		 1,  1,  0,
+
+		 -1,  -1,  0,
+		 1,  -1,  0,
+		 1,  1,  0,
+	 ];
+	gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STATIC_DRAW);
+	triangleVertexPositionBuffer.itemSize = 3;
+	triangleVertexPositionBuffer.numItems = 3 * 2;
+}
+
+
+function tick() {
+
+// 1st pass: Trace
+	gl.bindFramebuffer(gl.FRAMEBUFFER, rttFramebuffer);
+
+	gl.useProgram(traceProgram);
+  	gl.uniform1i(gl.getUniformLocation(traceProgram, "globalSeed"), Math.random() * 32768.0);
+	gl.uniform1i(gl.getUniformLocation(traceProgram, "baseSampleIndex"), getCurrentFrame());
+	gl.uniform2i(
+		gl.getUniformLocation(traceProgram, "resolution"),
+		getRenderTargetWidth(),
+		getRenderTargetHeight());
+
+	gl.bindBuffer(gl.ARRAY_BUFFER, triangleVertexPositionBuffer);
+	gl.vertexAttribPointer(
+		traceProgram.vertexPositionAttribute,
+		triangleVertexPositionBuffer.itemSize,
+		gl.FLOAT,
+		false,
+		0,
+		0);
+
+    	gl.viewport(0, 0, gl.viewportWidth, gl.viewportHeight);
+
+	gl.disable(gl.DEPTH_TEST);
+	gl.enable(gl.BLEND);
+	gl.blendFunc(gl.ONE, gl.ONE);
+
+	gl.drawArrays(gl.TRIANGLES, 0, triangleVertexPositionBuffer.numItems);
+
+// 2nd pass: Average
+   	gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+	gl.useProgram(copyProgram);
+	gl.uniform1i(gl.getUniformLocation(copyProgram, "sampleCount"), getCurrentFrame() + 1);
+
+	gl.bindBuffer(gl.ARRAY_BUFFER, triangleVertexPositionBuffer);
+	gl.vertexAttribPointer(
+		copyProgram.vertexPositionAttribute,
+		triangleVertexPositionBuffer.itemSize,
+		gl.FLOAT,
+		false,
+		0,
+		0);
+
+    	gl.viewport(0, 0, gl.viewportWidth, gl.viewportHeight);
+
+	gl.disable(gl.DEPTH_TEST);
+	gl.disable(gl.BLEND);
+
+	gl.activeTexture(gl.TEXTURE0);
+    	gl.bindTexture(gl.TEXTURE_2D, rttTexture);
+	gl.uniform1i(gl.getUniformLocation(copyProgram, "radianceTexture"), 0);
+	gl.uniform2i(
+		gl.getUniformLocation(copyProgram, "resolution"),
+		getRenderTargetWidth(),
+		getRenderTargetHeight());
+
+	gl.drawArrays(gl.TRIANGLES, 0, triangleVertexPositionBuffer.numItems);
+
+	gl.bindTexture(gl.TEXTURE_2D, null);
+}
+
+function init() {
+	initShaders();
+	initBuffers();
+	gl.clear(gl.COLOR_BUFFER_BIT);
+
+	rttFramebuffer = gl.createFramebuffer();
+	gl.bindFramebuffer(gl.FRAMEBUFFER, rttFramebuffer);
+
+	rttTexture = gl.createTexture();
+	gl.bindTexture(gl.TEXTURE_2D, rttTexture);
+    	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+
+	gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, getRenderTargetWidth(), getRenderTargetHeight(), 0, gl.RGBA, gl.FLOAT, null);
+
+	gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, rttTexture, 0);
+}
+
+var oldWidth = 0;
+var oldTraceProgram;
+var oldCopyProgram;
+function compute(canvas) {
+
+	if(	getRenderTargetWidth() != oldWidth ||
+		oldTraceProgram != document.getElementById("TraceFS") ||
+		oldCopyProgram !=  document.getElementById("CopyFS"))
+	{
+		init();
+
+		oldWidth = getRenderTargetWidth();
+		oldTraceProgram = document.getElementById("TraceFS");
+		oldCopyProgram = document.getElementById("CopyFS");
+	}
+
+	tick();
+}
